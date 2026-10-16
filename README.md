@@ -83,21 +83,37 @@ uv run ocuoc
 | Esc | 物理 Esc 中止本轮输入；AI 的 `SendInput` 带注入标记，不会误中止 |
 | 人为接管 | 人在目标窗上的物理点击会中断 AI；下次 `get_window_state` 带 `human_takeover` |
 
-工具一览：`list_apps`、`list_windows`、`list_displays`、`get_window`、`get_window_state`、`screenshot_desktop`、`activate_window`、`launch_app`、`wait_for_window`、`close_window`、`click`、`type_text`、`press_key`、`hold_key`、`scroll`、`drag`、`mouse_down`、`mouse_up`、`set_value`、`move_pointer`、`perform_secondary_action`。
+工具一览：`list_apps`、`list_windows`、`list_displays`、`get_window`、`get_window_state`、`screenshot_desktop`、`activate_window`、`launch_app`、`wait_for_window`、`close_window`、`click`、`type_text`、`press_key`、`hold_key`、`scroll`、`drag`、`mouse_down`、`mouse_up`、`set_value`、`move_pointer`、`perform_secondary_action`，以及浏览器桥 `browser_*`（见下方）。
+
+## 浏览器桥（可选）
+
+仓库根目录 `ext/` 是自研 MV3 扩展（无侧栏、无账号）。MCP 进程在本机 `127.0.0.1` 开 WebSocket，扩展连上后提供标签、截图、光标到达协议和 CDP 输入。
+
+1. Chrome 打开 `chrome://extensions`，打开**开发者模式**，**加载已解压的扩展程序**，选仓库里的 `ext/`。
+2. 跑 MCP（`python -m ocuoc` / `uv run ocuoc`）。
+3. 调用 `browser_bridge_info`，把返回的 `ws_url` 和 `pairing_secret` 填进扩展 **options** 页并保存。
+4. 扩展 action 徽标：`●` 已连接，`○` 未连接。
+
+**`chrome.debugger` 会弹出系统调试横幅**（「正在调试」一类提示）。这是 Chrome 对 `debugger` 权限的正常行为，无法也不应隐藏。
+
+浏览器点击坐标是 **CSS 像素**（视口原点）。`browser_screenshot` / `browser_get_state` 的图是设备像素，结果带 `dpr`：`css = device / dpr`。`generation` 是 `tab_id + url` 指纹。`browser_eval` 默认关闭，需要时设环境变量 `OCUOC_BROWSER_EVAL=1`。
+
+光标运动有两个 profile：默认 `desktop`（现有桌面 overlay / SendInput）。浏览器弹簧模型用 `OCUOC_CURSOR_PROFILE=browser` 或 `Overlay(profile="browser")`。
 
 ## 测试
 
 ```powershell
-uv run pytest tests -q
+uv run pytest tests -q -m "not live"
 uv run pytest tests -m live -q
 ```
 
-`-m live` 会驱动真实 GUI（记事本等）。
+`-m live` 会驱动真实 GUI（记事本等），可选 headless Chrome。
 
 ## 项目结构
 
 ```
-src/ocuoc/          MCP server、引擎、Win32 / UIA / 截屏 / 输入
+src/ocuoc/          MCP server、引擎、Win32 / UIA / 截屏 / 输入 / browser 桥
+ext/                MV3 Browser Bridge（load-unpacked）
 tests/              单元测试与可选 live 测试
 scripts/            管理员启动包装
 ```

@@ -6,7 +6,9 @@ from ocuoc.collab.cursor_glyph import (
     GLYPH_PX,
     P0,
     REST_HEADING,
+    compose_axis_matrix,
     heading_for_velocity,
+    plugin_sprite,
     rasterize_sprite,
     sample_outline,
     sprite,
@@ -78,6 +80,35 @@ def test_edges_are_antialiased():
             if 12 <= a <= 240:
                 partial += 1
     assert partial > 40
+
+
+def test_plugin_sprite_is_black_plane_with_cyan_glow():
+    w, h, hx, hy, pixels = plugin_sprite()
+    assert 24 <= w <= 96
+    assert 24 <= h <= 96
+    assert 8 <= hx <= w - 8
+    dark = glow = 0
+    for p in pixels:
+        pix = int(p)
+        a = (pix >> 24) & 255
+        if a < 40:
+            continue
+        r, g, b = (pix >> 16) & 255, (pix >> 8) & 255, pix & 255
+        ru, gu, bu = r * 255 // a, g * 255 // a, b * 255 // a
+        if ru < 50 and gu < 50 and bu < 50:
+            dark += 1
+        if bu > ru + 20 and gu > 80 and bu > 120:
+            glow += 1
+    assert dark > 15
+    assert glow > 15
+
+
+def test_compose_axis_matrix_is_2x2():
+    m = compose_axis_matrix(44.0, 1.15, -44.0, 1.0, 0.8)
+    assert len(m) == 2
+    assert len(m[0]) == 2
+    det = m[0][0] * m[1][1] - m[0][1] * m[1][0]
+    assert abs(det) > 0.2
 
 
 def test_bezier_tangent_points_along_the_path():

@@ -154,6 +154,13 @@ def test_cursor_event_names():
     assert event_name(123, "shutdown") == "Local\\OcuocCursor-123-shutdown"
 
 
+def test_wait_overlay_uses_overlay_move_timeout():
+    guard, collab, overlay, _cursor = _collab()
+    overlay.move_timeout = 1.5
+    collab.wait_overlay()
+    assert ("wait", 1.5) in overlay.calls
+
+
 def test_type_text_stops_when_proceed_false(monkeypatch):
     sent: list[int] = []
     monkeypatch.setattr(sendinput, "_send", lambda inputs: sent.append(len(inputs)))
