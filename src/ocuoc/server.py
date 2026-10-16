@@ -6,6 +6,7 @@ from typing import Any
 from mcp.server import MCPServer
 from mcp.server.mcpserver import Image
 
+from ocuoc.browser.tools import install_browser_tools
 from ocuoc.engine import ComputerUseEngine, ViewResult
 from ocuoc.errors import EngineError
 
@@ -19,7 +20,9 @@ mcp = MCPServer(
         "move_pointer, mouse_down/up, and scroll are client-area pixels of the last "
         "screenshot (top-left). Pass screenshot_id from get_window_state when clicking "
         "by x,y. Pass generation into mutating calls. Esc aborts input. Run the host "
-        "elevated for UIPI / cross-user / protected-window capture."
+        "elevated for UIPI / cross-user / protected-window capture. Browser tools "
+        "(browser_*) talk to the unpacked ext/ bridge over ws://127.0.0.1; click x,y "
+        "are CSS pixels. chrome.debugger shows a system banner while attached."
     ),
 )
 
@@ -331,6 +334,9 @@ def perform_secondary_action(
         action=action,
         generation=generation,
     )
+
+
+install_browser_tools(mcp, engine)
 
 
 def main() -> None:

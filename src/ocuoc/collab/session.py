@@ -56,6 +56,7 @@ class Collaboration:
         self.hooks = hooks if hooks is not None else InputHooks(self)
         self.overlay = overlay if overlay is not None else Overlay()
         self.cursor = cursor if cursor is not None else CursorSupervisor()
+        self.on_abort = None
         if hasattr(self.overlay, "on_pulse"):
             self.overlay.on_pulse = self._pulse
 
@@ -113,7 +114,9 @@ class Collaboration:
             pass
         self._suppress_system()
 
-    def wait_overlay(self, timeout: float = MOVE_TIMEOUT) -> None:
+    def wait_overlay(self, timeout: float | None = None) -> None:
+        if timeout is None:
+            timeout = float(getattr(self.overlay, "move_timeout", MOVE_TIMEOUT))
         wait = getattr(self.overlay, "wait_idle", None)
         if wait:
             wait(timeout)
@@ -193,6 +196,12 @@ class Collaboration:
 
     def _takeover(self, reason: str) -> None:
         self.guard.abort(reason)
+        cb = self.on_abort
+        if cb:
+            try:
+                cb(reason)
+            except Exception:
+                pass
         self.end_session(restore=True, wait=False)
 
     def _pulse(self) -> None:

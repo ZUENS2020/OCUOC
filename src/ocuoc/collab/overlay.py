@@ -7,7 +7,11 @@ import threading
 import time
 from ctypes import wintypes
 
-from ocuoc.collab.cursor_glyph import blit_rotated, heading_for_velocity
+from ocuoc.collab.cursor_glyph import (
+    blit_browser_visual,
+    blit_rotated,
+    heading_for_velocity,
+)
 from ocuoc.input.motion import (
     DT,
     MOVE_TIMEOUT,
@@ -16,6 +20,9 @@ from ocuoc.input.motion import (
     simulate,
     squash_scale,
 )
+from ocuoc.input.motion_browser import FRAME_DT_MIN as BROWSER_DT
+from ocuoc.input.motion_browser import ARRIVAL_TIMEOUT_MS, CursorState
+from ocuoc.input.profile import PROFILE_BROWSER, cursor_profile
 from ocuoc.winapi import (
     AC_SRC_ALPHA,
     AC_SRC_OVER,
@@ -49,6 +56,8 @@ from ocuoc.winapi import (
     WS_EX_TRANSPARENT,
     WS_POPUP,
     HTTRANSPARENT,
+    SM_CXVIRTUALSCREEN,
+    SM_CYVIRTUALSCREEN,
     SM_XVIRTUALSCREEN,
     SM_YVIRTUALSCREEN,
     gdi32,
@@ -90,7 +99,7 @@ class Overlay:
     press visual held >= 100ms via timer id 3.
     """
 
-    def __init__(self, *, exclude_from_capture: bool = False) -> None:
+    def __init__(self, *, exclude_from_capture: bool = False, profile: str | None = None) -> None:
         self._thread: threading.Thread | None = None
         self._tid = 0
         self._hwnd = 0
@@ -122,6 +131,24 @@ class Overlay:
         self._exclude_from_capture = exclude_from_capture
         self._bold = False
         self.on_pulse = None
+        self._profile = cursor_profile(profile)
+        self._browser_state: CursorState | None = None
+        self._browser_now = 0.0
+
+    @property
+    def profile(self) -> str:
+        return self._profile
+
+    @property
+    def move_timeout(self) -> float:
+        if self._profile == PROFILE_BROWSER:
+            return ARRIVAL_TIMEOUT_MS / 1000.0
+        return MOVE_TIMEOUT
+
+    def _viewport_bounds(self) -> tuple[float, float]:
+        w = max(int(user32.GetSystemMetrics(SM_CXVIRTUALSCREEN)), 1)
+        h = max(int(user32.GetSystemMetrics(SM_CYVIRTUALSCREEN)), 1)
+        return (float(w), float(h))
 
     @property
     def alive(self) -> bool:
@@ -153,22 +180,31 @@ class Overlay:
             self._ty = int(y)
             self._press = bool(press)
             self._visible = True
-            plan = build_move((float(self._cx), float(self._cy)), (float(self._tx), float(self._ty)))
-            if plan.snapped:
-                # < 0.5px: apply immediately, no animation (sub_140050030 path)
-                self._plan = None
-                self._samples = []
-                self._si = 0
-                self._flying = False
-                self._squash = 1.0
-                self._cx, self._cy = self._tx, self._ty
-            else:
-                self._plan = plan
-                self._samples = simulate(plan.T, plan.zeta)
-                self._si = 0
-                self._flying = True
+            if self._profile == PROFILE_BROWSER:
+                start = (float(self._cx), float(self._cy))
+                if self._browser_state is None:
+                    self._browser_state = CursorState.create(start, True)
+                self._browser_state.set_target((float(self._tx), float(self._ty)), self._viewport_bounds())
+                self._flying = self._browser_state.motion is not None
                 self._accum = 0.0
-                self._squash = 1.0
+                self._last_tick = 0.0
+            else:
+                plan = build_move((float(self._cx), float(self._cy)), (float(self._tx), float(self._ty)))
+                if plan.snapped:
+                    # < 0.5px: apply immediately, no animation (sub_140050030 path)
+                    self._plan = None
+                    self._samples = []
+                    self._si = 0
+                    self._flying = False
+                    self._squash = 1.0
+                    self._cx, self._cy = self._tx, self._ty
+                else:
+                    self._plan = plan
+                    self._samples = simulate(plan.T, plan.zeta)
+                    self._si = 0
+                    self._flying = True
+                    self._accum = 0.0
+                    self._squash = 1.0
         if self._hwnd:
             user32.SendMessageW(self._hwnd, WM_OCUOC_MOVE, 1 if press else 0, 0)
 
@@ -187,17 +223,23 @@ class Overlay:
             self._angle = 0.0
             self._visible = True
             self._has_agent = True
+            if self._profile == PROFILE_BROWSER:
+                self._browser_state = CursorState.create((float(x), float(y)), True)
+                self._browser_state.set_target((float(x), float(y)), self._viewport_bounds())
         if self._hwnd:
             user32.SendMessageW(self._hwnd, WM_OCUOC_MOVE, 0, 0)
 
-    def wait_idle(self, timeout: float = MOVE_TIMEOUT) -> None:
+    def wait_idle(self, timeout: float | None = None) -> None:
         """Wait until the spring settles (and the press hold elapses)."""
+        if timeout is None:
+            timeout = self.move_timeout
         deadline = time.monotonic() + timeout
         visible = False
         while time.monotonic() < deadline:
             with self._lock:
                 visible = self._visible
-                idle = not self._flying and not self._press
+                busy = bool(self._browser_state and self._browser_state.busy()) if self._profile == PROFILE_BROWSER else False
+                idle = not self._flying and not self._press and not busy
             if visible and idle:
                 return
             time.sleep(0.005)
@@ -217,6 +259,7 @@ class Overlay:
             self._samples = []
             self._flying = False
             self._squash = 1.0
+            self._browser_state = None
         if self._hwnd:
             user32.PostMessageW(self._hwnd, WM_OCUOC_HIDE, 0, 0)
 
@@ -314,43 +357,64 @@ class Overlay:
 
     def _tick_anim(self, hwnd) -> None:
         with self._lock:
-            if not self._visible or not self._flying or not self._samples:
-                return
-            now = time.perf_counter()
-            if self._last_tick:
-                self._accum += min(0.25, now - self._last_tick)
-            self._last_tick = now
-            landed = False
-            while self._accum >= DT:
-                self._accum -= DT
-                self._si += 1
-                if self._si >= len(self._samples) - 1:
-                    self._si = len(self._samples) - 1
-                    landed = True
-                _t, p, v = self._samples[self._si]
-                plan = self._plan
-                if landed or plan is None:
-                    break
-                pos, tan = plan.sample(min(1.0, max(0.0, p)))
-                self._cx = int(round(pos[0]))
-                self._cy = int(round(pos[1]))
-                self._angle = heading_for_velocity(tan[0], tan[1]) + math.radians(
-                    plan.wobble_at(p)
-                )
-                self._squash = squash_scale(abs(v) * plan.arc)
-                if landed:
-                    break
-            if landed or self._si >= len(self._samples) - 1:
-                plan = self._plan
-                if plan is not None:
-                    _, tan = plan.sample(1.0)
+            if self._profile == PROFILE_BROWSER:
+                if not self._visible or self._browser_state is None:
+                    return
+                now = time.perf_counter()
+                if self._last_tick:
+                    self._accum += min(0.25, now - self._last_tick)
+                self._last_tick = now
+                while self._accum >= BROWSER_DT:
+                    self._accum -= BROWSER_DT
+                    self._browser_now += BROWSER_DT
+                    arrived = self._browser_state.step(BROWSER_DT, self._browser_now)
+                    self._cx = int(round(self._browser_state.point[0]))
+                    self._cy = int(round(self._browser_state.point[1]))
+                    if arrived:
+                        self._flying = False
+                    if not self._browser_state.busy():
+                        self._flying = False
+                        self._cx, self._cy = self._tx, self._ty
+                        self._last_tick = 0.0
+                        break
+            else:
+                if not self._visible or not self._flying or not self._samples:
+                    return
+                now = time.perf_counter()
+                if self._last_tick:
+                    self._accum += min(0.25, now - self._last_tick)
+                self._last_tick = now
+                landed = False
+                while self._accum >= DT:
+                    self._accum -= DT
+                    self._si += 1
+                    if self._si >= len(self._samples) - 1:
+                        self._si = len(self._samples) - 1
+                        landed = True
+                    _t, p, v = self._samples[self._si]
+                    plan = self._plan
+                    if landed or plan is None:
+                        break
+                    pos, tan = plan.sample(min(1.0, max(0.0, p)))
+                    self._cx = int(round(pos[0]))
+                    self._cy = int(round(pos[1]))
                     self._angle = heading_for_velocity(tan[0], tan[1]) + math.radians(
-                        plan.wobble_at(1.0)
+                        plan.wobble_at(p)
                     )
-                self._cx, self._cy = self._tx, self._ty
-                self._flying = False
-                self._squash = 1.0
-                self._last_tick = 0.0
+                    self._squash = squash_scale(abs(v) * plan.arc)
+                    if landed:
+                        break
+                if landed or self._si >= len(self._samples) - 1:
+                    plan = self._plan
+                    if plan is not None:
+                        _, tan = plan.sample(1.0)
+                        self._angle = heading_for_velocity(tan[0], tan[1]) + math.radians(
+                            plan.wobble_at(1.0)
+                        )
+                    self._cx, self._cy = self._tx, self._ty
+                    self._flying = False
+                    self._squash = 1.0
+                    self._last_tick = 0.0
         self._apply_pos(hwnd)
 
     def _apply_pos(self, hwnd) -> None:
@@ -421,17 +485,23 @@ class Overlay:
             cx, cy = self._cx, self._cy
             angle = self._angle
             squash = self._squash
-        scale_x = 1.0
-        scale_y = squash
-        alpha = 1.0
-        if press:
-            # press visual (exact form not decoded; dip inferred)
-            scale_x = 0.88
-            scale_y = min(scale_y, 0.80)
-        if self._bold:
-            scale_x *= 1.35
-            scale_y *= 1.35
-        blit_rotated(px, w, HOTSPOT[0], HOTSPOT[1], angle, scale_x, alpha, scale_y)
+            vis = None
+            if self._profile == PROFILE_BROWSER and self._browser_state is not None:
+                vis = self._browser_state.render(self._browser_now)
+        if vis is not None:
+            blit_browser_visual(px, w, HOTSPOT[0], HOTSPOT[1], vis, press=press)
+        else:
+            scale_x = 1.0
+            scale_y = squash
+            alpha = 1.0
+            if press:
+                # press visual (exact form not decoded; dip inferred)
+                scale_x = 0.88
+                scale_y = min(scale_y, 0.80)
+            if self._bold:
+                scale_x *= 1.35
+                scale_y *= 1.35
+            blit_rotated(px, w, HOTSPOT[0], HOTSPOT[1], angle, scale_x, alpha, scale_y)
         blend = BLENDFUNCTION(AC_SRC_OVER, 0, 255, AC_SRC_ALPHA)
         src = wintypes.POINT(0, 0)
         size = SIZE(w, w)
