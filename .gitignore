@@ -13,6 +13,9 @@ build/
 .python-version
 .uv/
 
+# Isolated git worktrees
+.worktrees/
+
 # Local editor / MCP host config
 .cursor/
 .idea/
