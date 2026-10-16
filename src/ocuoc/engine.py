@@ -6,6 +6,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from ocuoc.browser.api import BrowserHost
 from ocuoc.capture.coords import image_xy_to_screen
 from ocuoc.capture.screenshot import CaptureResult, capture_desktop, capture_window
 from ocuoc.collab import Collaboration
@@ -34,6 +35,7 @@ class ComputerUseEngine:
         enable_dpi_awareness()
         self.guard = guard or Guard.from_env()
         self.collab = collab if collab is not None else Collaboration(self.guard)
+        self.browser = BrowserHost()
         self._started = False
         self._shot: dict[str, CaptureResult] = {}
         self._elements: dict[str, list[dict]] = {}
@@ -43,8 +45,13 @@ class ComputerUseEngine:
             return
         self._started = True
         self.collab.start()
+        self.collab.on_abort = self.browser.abort
 
     def stop(self) -> None:
+        try:
+            self.browser.stop()
+        except Exception:
+            pass
         self.collab.stop()
         self._started = False
 

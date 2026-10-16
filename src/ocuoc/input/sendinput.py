@@ -13,6 +13,10 @@ from ocuoc.input.motion import (
     PRESS_MS,
     iter_move_frames,
 )
+from ocuoc.input.motion_browser import ARRIVAL_TIMEOUT_MS as BROWSER_ARRIVAL_MS
+from ocuoc.input.motion_browser import FRAME_DT_MIN as BROWSER_DT
+from ocuoc.input.motion_browser import iter_move_frames as browser_iter_move_frames
+from ocuoc.input.profile import PROFILE_BROWSER, cursor_profile
 from ocuoc.keys import modifier_vk, parse_hotkey, vk_name
 from ocuoc.winapi import (
     INPUT,
@@ -97,9 +101,43 @@ def _move_now(x: int, y: int) -> None:
     _dwm_flush()
 
 
+def _virtual_bounds() -> tuple[float, float]:
+    vw = max(int(user32.GetSystemMetrics(SM_CXVIRTUALSCREEN)), 1)
+    vh = max(int(user32.GetSystemMetrics(SM_CYVIRTUALSCREEN)), 1)
+    return float(vw), float(vh)
+
+
+def _glide_browser(x: int, y: int, proceed: Callable[[], bool] | None = None) -> None:
+    """Browser profile: consume motion_browser frames; stop SendInput on arrival (no think wobble)."""
+    x0, y0 = cursor_pos()
+    start = time.perf_counter()
+    n = 0
+    for _t, state in browser_iter_move_frames(
+        (float(x0), float(y0)),
+        (float(x), float(y)),
+        _virtual_bounds(),
+    ):
+        if proceed is not None and not proceed():
+            return
+        if time.perf_counter() - start > BROWSER_ARRIVAL_MS / 1000.0:
+            break
+        px, py = state.point
+        _move_now(int(round(px)), int(round(py)))
+        n += 1
+        remain = start + n * BROWSER_DT - time.perf_counter()
+        if remain > 0:
+            time.sleep(remain)
+        if state.motion is None:
+            break
+    _move_now(x, y)
+
+
 def _glide(x: int, y: int, proceed: Callable[[], bool] | None = None) -> None:
     """Glide the real cursor along the replicated Codex motion:
     same decision tree, bulged/subdivided path and 60Hz spring timing."""
+    if cursor_profile() == PROFILE_BROWSER:
+        _glide_browser(x, y, proceed=proceed)
+        return
     x0, y0 = cursor_pos()
     frames = iter_move_frames((float(x0), float(y0)), (float(x), float(y)))
     if len(frames) <= 1:
