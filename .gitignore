@@ -1,0 +1,43 @@
+# Python / uv
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+*.egg-info/
+dist/
+build/
+.python-version
+.uv/
+
+# Local editor / MCP host config
+.cursor/
+.idea/
+.vscode/
+*.code-workspace
+
+# Secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials.json
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Reverse-engineering notes, captures, dumps, and comparison reports.
+# Keep them on disk for local work; they must not be published.
+docs/
+*.idb
+*.i64
+*.ghidra
+*.bindiff
+ghidra_projects/
+ida_projects/

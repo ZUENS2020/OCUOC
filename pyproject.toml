@@ -1,0 +1,32 @@
+[project]
+name = "ocuoc"
+version = "0.1.0"
+description = "Clean-room Windows computer-use MCP (no OpenAI account)"
+authors = [
+    { name = "ZUENS2020", email = "shengyuanzhang-zuens2020@outlook.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "comtypes>=1.4.17",
+    "mcp>=2.3.0",
+    "mss>=10.1.0",
+    "pillow>=12.3.0",
+    "uiautomation>=2.0.29",
+]
+
+[project.scripts]
+ocuoc = "ocuoc.server:main"
+
+[tool.pytest.ini_options]
+markers = [
+    "live: talks to a real Windows GUI",
+]
+
+[build-system]
+requires = ["uv_build>=0.9.10,<0.10.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
