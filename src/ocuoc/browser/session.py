@@ -18,10 +18,27 @@ def tab_generation(tab_id: int, url: str) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
 
+def snapshot_id(elements: list[dict[str, Any]]) -> str:
+    """Fingerprint of an AX+DOM element snapshot (SPA-safe; independent of generation)."""
+    compact = [
+        {
+            "i": el.get("element_index"),
+            "n": el.get("name"),
+            "t": el.get("control_type"),
+            "b": el.get("backendDOMNodeId"),
+            "rect": el.get("rect"),
+        }
+        for el in elements
+    ]
+    payload = json.dumps(compact, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
 class TabRegistry:
     def __init__(self) -> None:
         self._tabs: dict[int, dict[str, Any]] = {}
         self._dpr: dict[int, float] = {}
+        self._snapshots: dict[int, str] = {}
         self.events: list[dict[str, Any]] = []
         self.dialogs: list[dict[str, Any]] = []
 
@@ -59,6 +76,13 @@ class TabRegistry:
     def dpr(self, tab_id: int) -> float | None:
         return self._dpr.get(int(tab_id))
 
+    def remember_snapshot(self, tab_id: int, sid: str) -> str:
+        self._snapshots[int(tab_id)] = str(sid)
+        return str(sid)
+
+    def snapshot(self, tab_id: int) -> str | None:
+        return self._snapshots.get(int(tab_id))
+
     def on_tab_event(self, data: dict[str, Any]) -> None:
         self.events.append(data)
         kind = data.get("kind")
@@ -66,12 +90,14 @@ class TabRegistry:
             tid = int(data.get("tabId") or -1)
             self._tabs.pop(tid, None)
             self._dpr.pop(tid, None)
+            self._snapshots.pop(tid, None)
             return
         tab = data.get("tab") if isinstance(data.get("tab"), dict) else None
         if kind == "replaced":
             removed = int(data.get("removedTabId") or -1)
             self._tabs.pop(removed, None)
             self._dpr.pop(removed, None)
+            self._snapshots.pop(removed, None)
             if tab:
                 self.stamp(tab)
             return

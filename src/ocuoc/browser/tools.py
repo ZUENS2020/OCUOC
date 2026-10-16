@@ -48,7 +48,7 @@ def install_browser_tools(mcp, engine) -> None:
 
     @mcp.tool(structured_output=False)
     def browser_screenshot(tab_id: int, generation: str | None = None) -> Any:
-        """Capture the visible tab. Image pixels include DPR; click coordinates are CSS px. Result includes dpr."""
+        """Capture a tab via CDP without activating it. Device-pixel PNG; click coords are CSS px. Includes dpr."""
         from ocuoc.server import _wrap_view
 
         def _shot() -> ViewResult:
@@ -66,6 +66,7 @@ def install_browser_tools(mcp, engine) -> None:
         button: str = "left",
         count: int = 1,
         generation: str | None = None,
+        snapshot_id: str | None = None,
     ) -> dict[str, Any]:
         """Click CSS-pixel coordinates or an element_index from browser_get_state. Waits for cursor arrival first."""
         from ocuoc.server import _wrap
@@ -79,6 +80,7 @@ def install_browser_tools(mcp, engine) -> None:
             count=count,
             element_index=element_index,
             generation=generation,
+            snapshot_id=snapshot_id,
         )
 
     @mcp.tool()
@@ -88,6 +90,7 @@ def install_browser_tools(mcp, engine) -> None:
         y: float | None = None,
         element_index: int | None = None,
         generation: str | None = None,
+        snapshot_id: str | None = None,
     ) -> dict[str, Any]:
         """Double-click CSS-pixel coordinates or element_index."""
         from ocuoc.server import _wrap
@@ -101,6 +104,7 @@ def install_browser_tools(mcp, engine) -> None:
             count=2,
             element_index=element_index,
             generation=generation,
+            snapshot_id=snapshot_id,
         )
 
     @mcp.tool()
@@ -110,6 +114,7 @@ def install_browser_tools(mcp, engine) -> None:
         y: float | None = None,
         element_index: int | None = None,
         generation: str | None = None,
+        snapshot_id: str | None = None,
     ) -> dict[str, Any]:
         """Right-click CSS-pixel coordinates or element_index."""
         from ocuoc.server import _wrap
@@ -123,6 +128,7 @@ def install_browser_tools(mcp, engine) -> None:
             count=1,
             element_index=element_index,
             generation=generation,
+            snapshot_id=snapshot_id,
         )
 
     @mcp.tool()
@@ -134,7 +140,7 @@ def install_browser_tools(mcp, engine) -> None:
 
     @mcp.tool()
     def browser_press_keys(tab_id: int, keys: str, generation: str | None = None) -> dict[str, Any]:
-        """Press named keys such as Enter or ArrowDown (plus-separated)."""
+        """Press keys or chords such as Enter, ArrowDown, or ctrl+a (comma-separated sequence, plus-separated modifiers)."""
         from ocuoc.server import _wrap
 
         return _wrap(host().press_keys, tab_id=tab_id, keys=keys, generation=generation)
@@ -176,7 +182,7 @@ def install_browser_tools(mcp, engine) -> None:
         include_elements: bool = True,
         max_elements: int = 200,
     ) -> Any:
-        """AX+DOM element tree with CSS-px rects, generation, optional screenshot (device pixels) and dpr."""
+        """AX+DOM element tree with CSS-px rects, generation, snapshot_id, optional screenshot (device pixels) and dpr. Screenshot does not activate the tab. AX timeout falls back to DOM layout boxes."""
         from ocuoc.server import _wrap_view
 
         def _state() -> ViewResult:

@@ -24,4 +24,6 @@ This extension uses `chrome.debugger` so it can dispatch CDP mouse/keyboard even
 | `storage` | remember the pairing endpoint |
 | `host_permissions` 127.0.0.1 | local WebSocket only |
 
+Screenshots use `Page.captureScreenshot` and do **not** call `tabs.update({active:true})`. Discarded or unpaintable background tabs return an error instead of stealing focus.
+
 Identifiers on the wire are `cuoc.*` / `CUOC_*`. Page refresh hides the agent cursor (MVP; no GET restore).

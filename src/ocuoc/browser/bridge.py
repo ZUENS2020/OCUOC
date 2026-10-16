@@ -26,6 +26,7 @@ from ocuoc.browser.protocol import (
     request,
 )
 from ocuoc.browser.session import TabRegistry
+from ocuoc.errors import EngineError
 
 log = logging.getLogger("ocuoc.browser.bridge")
 
@@ -243,5 +244,10 @@ class BrowserBridge:
         fut: asyncio.Future = asyncio.get_running_loop().create_future()
         self._pending[mid] = fut
         assert self.conn is not None
-        await self.conn.send(dumps(request(mid, mtype, data)))
-        return await asyncio.wait_for(fut, timeout)
+        try:
+            await self.conn.send(dumps(request(mid, mtype, data)))
+            return await asyncio.wait_for(fut, timeout)
+        except TimeoutError as exc:
+            raise EngineError("bridge_timeout", f"{mtype} timed out after {timeout:.1f}s") from exc
+        finally:
+            self._pending.pop(mid, None)

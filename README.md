@@ -96,7 +96,7 @@ uv run ocuoc
 
 **`chrome.debugger` 会弹出系统调试横幅**（「正在调试」一类提示）。这是 Chrome 对 `debugger` 权限的正常行为，无法也不应隐藏。
 
-浏览器点击坐标是 **CSS 像素**（视口原点）。`browser_screenshot` / `browser_get_state` 的图是设备像素，结果带 `dpr`：`css = device / dpr`。`generation` 是 `tab_id + url` 指纹。`browser_eval` 默认关闭，需要时设环境变量 `OCUOC_BROWSER_EVAL=1`。
+浏览器点击坐标是 **CSS 像素**（视口原点）。`browser_screenshot` / `browser_get_state` 默认走 CDP `Page.captureScreenshot`，**不会激活标签**。图是设备像素，结果带 `dpr`：`css = device / dpr`。`generation` 是 `tab_id + url` 指纹；`snapshot_id` 绑定一次 `browser_get_state` 的元素树，按 `element_index` 点击时若对不上会拒绝。无布局框的 AX 节点不会点到 (0,0)。`browser_eval` 默认关闭，需要时设环境变量 `OCUOC_BROWSER_EVAL=1`。`browser_press_keys` 支持 `ctrl+a` 这类组合键。
 
 光标运动有两个 profile：默认 `desktop`（现有桌面 overlay / SendInput）。浏览器弹簧模型用 `OCUOC_CURSOR_PROFILE=browser` 或 `Overlay(profile="browser")`。
 

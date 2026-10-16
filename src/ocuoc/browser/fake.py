@@ -37,6 +37,9 @@ class FakeExtension:
         self.badges: dict[int, str | None] = {}
         self.eval_calls: list[str] = []
         self.dialogs: list[dict[str, Any]] = []
+        self.hang_types: set[str] = set()
+        self.ax_name = "Go"
+        self.last_key: dict[str, Any] = {}
         self._writer: asyncio.StreamWriter | None = None
 
     async def run(self) -> None:
@@ -71,8 +74,16 @@ class FakeExtension:
             if msg.get("id") is None:
                 continue
             mid, mtype, data = msg["id"], msg.get("type"), msg.get("data") or {}
+            if mtype in self.hang_types:
+                asyncio.create_task(self._hang_reply(writer, mid, mtype, data))
+                continue
             result = await self._handle(writer, mtype, data)
             await self._send(writer, {"id": mid, "ok": True, "result": result})
+
+    async def _hang_reply(self, writer, mid: int, mtype: str, data: dict[str, Any]) -> None:
+        await asyncio.sleep(30)
+        result = await self._handle(writer, mtype, data)
+        await self._send(writer, {"id": mid, "ok": True, "result": result})
 
     async def _handle(self, writer, mtype: str, data: dict[str, Any]) -> Any:
         if mtype == "cursor.set":
@@ -112,7 +123,17 @@ class FakeExtension:
             return {}
         if mtype == "page.screenshot":
             self.order.append("page.screenshot")
-            return {"dataUrl": "data:image/png;base64," + _PNG.decode("ascii")}
+            return {
+                "dataUrl": "data:image/png;base64," + _PNG.decode("ascii"),
+                "backend": "cdp",
+                "activated": False,
+            }
+        if mtype == "cdp.raw":
+            method = str(data.get("method") or "")
+            self.order.append(f"cdp.raw:{method}")
+            if method == "DOM.getContentQuads":
+                return {"quads": [[10.0, 20.0, 90.0, 20.0, 90.0, 44.0, 10.0, 44.0]]}
+            return {}
         if mtype == "page.axtree":
             self.order.append("page.axtree")
             return {
@@ -120,7 +141,7 @@ class FakeExtension:
                     {
                         "ignored": False,
                         "role": {"value": "button"},
-                        "name": {"value": "Go"},
+                        "name": {"value": self.ax_name},
                         "backendDOMNodeId": 1,
                     },
                     {"ignored": True, "role": {"value": "none"}, "name": {"value": ""}, "backendDOMNodeId": 2},
@@ -131,7 +152,7 @@ class FakeExtension:
             return {
                 "documents": [
                     {
-                        "nodes": {"backendNodeId": [1, 2]},
+                        "nodes": {"backendNodeId": [1, 2], "nodeName": ["BUTTON", "DIV"]},
                         "layout": {"nodeIndex": [0], "bounds": [[10.0, 20.0, 80.0, 24.0]]},
                     }
                 ]
@@ -156,8 +177,9 @@ class FakeExtension:
             self.order.append("input.text")
             return {}
         if mtype == "input.key":
+            self.last_key = dict(data)
             self.order.append("input.key")
-            return {"ok": True}
+            return {"ok": True, "chords": data.get("chords") or []}
         self.order.append(mtype or "?")
         return {}
 
