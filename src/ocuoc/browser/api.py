@@ -16,6 +16,7 @@ from ocuoc.browser.protocol import (
     BADGE_DELIVERABLE,
     BADGE_HANDOFF,
     BADGE_SET,
+    CDP_RAW,
     CURSOR_SET,
     INPUT_KEY,
     INPUT_MOUSE,
@@ -30,9 +31,56 @@ from ocuoc.browser.protocol import (
     TAB_NEW,
     TABS_LIST,
 )
+from ocuoc.browser.session import snapshot_id
 from ocuoc.errors import EngineError
+from ocuoc.keys import parse_hotkey
 
 EVAL_ENV = "OCUOC_BROWSER_EVAL"
+
+
+def parse_browser_chords(keys: list[str]) -> list[dict[str, Any]]:
+    """Turn 'ctrl+a' / 'Enter' specs into CDP modifier bits + key name."""
+    chords: list[dict[str, Any]] = []
+    for spec in keys:
+        mods, key = parse_hotkey(spec)
+        bits = 0
+        names: list[str] = []
+        for mod in mods:
+            if mod == "ctrl":
+                bits |= 2
+                names.append("ctrl")
+            elif mod == "alt":
+                bits |= 1
+                names.append("alt")
+            elif mod in {"meta", "win"}:
+                bits |= 4
+                names.append("meta")
+            elif mod == "shift":
+                bits |= 8
+                names.append("shift")
+        chords.append({"key": key, "modifiers": bits, "modNames": names})
+    return chords
+
+
+def _quad_center(quad: list[Any]) -> tuple[float, float] | None:
+    if not isinstance(quad, (list, tuple)) or len(quad) < 8:
+        return None
+    xs = [float(quad[i]) for i in range(0, 8, 2)]
+    ys = [float(quad[i]) for i in range(1, 8, 2)]
+    width = max(xs) - min(xs)
+    height = max(ys) - min(ys)
+    if width <= 0 or height <= 0:
+        return None
+    return (sum(xs) / 4.0, sum(ys) / 4.0)
+
+
+def _valid_rect(rect: Any) -> bool:
+    if not isinstance(rect, dict):
+        return False
+    try:
+        return float(rect.get("width", 0)) > 0 and float(rect.get("height", 0)) > 0
+    except (TypeError, ValueError):
+        return False
 
 
 def _ax_value(node: Any, key: str) -> str:
@@ -76,12 +124,13 @@ def merge_ax_dom(ax: Any, snapshot: Any) -> list[dict[str, Any]]:
             }
     elements: list[dict[str, Any]] = []
     idx = 0
+    skip_roles = {"webarea", "document", "rootwebarea", "iframe", "none", "ignored"}
     for node in ax_nodes:
         if not isinstance(node, dict) or node.get("ignored"):
             continue
         name = _ax_value(node, "name")
         role = _ax_value(node, "role")
-        if not name.strip() and role.lower() in {"generic", "none", "ignored", ""}:
+        if role.lower() in skip_roles or not name.strip():
             continue
         backend = node.get("backendDOMNodeId")
         rect = layout_index.get(int(backend)) if backend is not None else None
@@ -93,6 +142,76 @@ def merge_ax_dom(ax: Any, snapshot: Any) -> list[dict[str, Any]]:
                 "backendDOMNodeId": backend,
                 "rect": rect,
                 "source": "ax+dom",
+            }
+        )
+        idx += 1
+    return elements
+
+
+_SKIP_DOM_TAGS = {
+    "HTML",
+    "HEAD",
+    "BODY",
+    "SCRIPT",
+    "STYLE",
+    "META",
+    "LINK",
+    "NOSCRIPT",
+    "BR",
+    "#comment",
+    "#document",
+}
+
+
+def elements_from_dom(snapshot: Any, max_elements: int = 200) -> list[dict[str, Any]]:
+    """Layout boxes from DOMSnapshot when the AX tree is missing or timed out."""
+    if not isinstance(snapshot, dict):
+        return []
+    documents = snapshot.get("documents")
+    if not isinstance(documents, list) or not documents:
+        return []
+    doc = documents[0] or {}
+    nodes = doc.get("nodes") or {}
+    backend_ids = nodes.get("backendNodeId") or []
+    node_names = nodes.get("nodeName") or []
+    layout = doc.get("layout") or {}
+    node_index = layout.get("nodeIndex") or []
+    bounds = layout.get("bounds") or []
+    elements: list[dict[str, Any]] = []
+    idx = 0
+    limit = max(1, int(max_elements))
+    for i, ni in enumerate(node_index):
+        if idx >= limit:
+            break
+        if not isinstance(ni, int) or ni < 0 or i >= len(bounds):
+            continue
+        box = bounds[i]
+        if not isinstance(box, (list, tuple)) or len(box) < 4:
+            continue
+        try:
+            width = float(box[2])
+            height = float(box[3])
+        except (TypeError, ValueError):
+            continue
+        if width < 8 or height < 8:
+            continue
+        tag = str(node_names[ni]) if ni < len(node_names) else ""
+        if tag.upper() in _SKIP_DOM_TAGS:
+            continue
+        bid = int(backend_ids[ni]) if ni < len(backend_ids) else None
+        elements.append(
+            {
+                "element_index": idx,
+                "name": tag,
+                "control_type": tag or "DOM",
+                "backendDOMNodeId": bid,
+                "rect": {
+                    "x": int(round(float(box[0]))),
+                    "y": int(round(float(box[1]))),
+                    "width": int(round(width)),
+                    "height": int(round(height)),
+                },
+                "source": "dom",
             }
         )
         idx += 1
@@ -147,18 +266,35 @@ class BrowserApi:
 
     async def screenshot(self, tab_id: int, generation: str | None = None) -> tuple[bytes, dict[str, Any]]:
         await self._ensure_tab(tab_id, generation)
-        res = await self.bridge.call(PAGE_SCREENSHOT, {"tabId": int(tab_id)}, timeout=15.0)
+        res = None
+        last_exc: Exception | None = None
+        for timeout in (15.0, 20.0):
+            try:
+                res = await self.bridge.call(PAGE_SCREENSHOT, {"tabId": int(tab_id)}, timeout=timeout)
+                break
+            except EngineError as exc:
+                last_exc = exc
+                if exc.code != "bridge_timeout":
+                    raise
+        if res is None:
+            raise last_exc or EngineError("screenshot_failed", "page.screenshot timed out")
         data_url = (res or {}).get("dataUrl") if isinstance(res, dict) else ""
         if not data_url or "," not in str(data_url):
             raise EngineError("screenshot_failed", "page.screenshot returned no image")
         png = base64.b64decode(str(data_url).split(",", 1)[1])
         dpr = await self.device_pixel_ratio(tab_id)
         shot_id = secrets.token_hex(8)
+        backend = "cdp"
+        activated = False
+        if isinstance(res, dict):
+            backend = str(res.get("backend") or "cdp")
+            activated = bool(res.get("activated"))
         meta = {
             "screenshot_id": shot_id,
             "dpr": dpr,
             "tab_id": int(tab_id),
-            "capture_backend": "captureVisibleTab",
+            "capture_backend": backend,
+            "tab_activated": activated,
         }
         return png, meta
 
@@ -182,10 +318,31 @@ class BrowserApi:
         }
         png = None
         if include_elements:
-            ax = await self.bridge.call(PAGE_AXTREE, {"tabId": int(tab_id)}, timeout=20.0)
-            dom = await self.bridge.call(PAGE_DOM, {"tabId": int(tab_id)}, timeout=20.0)
-            elements = merge_ax_dom(ax, dom)[: max(1, int(max_elements))]
+            ax: Any = {"nodes": []}
+            dom: Any = {}
+            limit = max(1, int(max_elements))
+            ax_res, dom_res = await asyncio.gather(
+                self.bridge.call(
+                    PAGE_AXTREE,
+                    {"tabId": int(tab_id), "depth": 20},
+                    timeout=12.0,
+                ),
+                self.bridge.call(PAGE_DOM, {"tabId": int(tab_id)}, timeout=15.0),
+                return_exceptions=True,
+            )
+            if isinstance(ax_res, Exception):
+                payload["ax_error"] = str(ax_res) or ax_res.__class__.__name__
+            else:
+                ax = ax_res
+            if isinstance(dom_res, Exception):
+                payload["dom_error"] = str(dom_res) or dom_res.__class__.__name__
+            else:
+                dom = dom_res
+            elements = merge_ax_dom(ax, dom)[:limit]
+            if not elements:
+                elements = elements_from_dom(dom, max_elements=limit)
             payload["elements"] = elements
+            payload["snapshot_id"] = self.bridge.tabs.remember_snapshot(tab_id, snapshot_id(elements))
         if include_screenshot:
             png, meta = await self.screenshot(tab_id, generation=generation)
             payload.update(meta)
@@ -252,15 +409,74 @@ class BrowserApi:
                 return bool(tab.get("active"))
         return True
 
-    def _element_point(self, elements: list[dict[str, Any]], element_index: int) -> tuple[float, float]:
+    def _lookup_element(self, elements: list[dict[str, Any]], element_index: int) -> dict[str, Any]:
         for el in elements:
             if int(el.get("element_index", -1)) == int(element_index):
-                rect = el.get("rect") or {}
-                return (
-                    float(rect.get("x", 0)) + float(rect.get("width", 0)) / 2.0,
-                    float(rect.get("y", 0)) + float(rect.get("height", 0)) / 2.0,
-                )
+                return el
         raise EngineError("unknown_element", f"element_index {element_index} not in last browser_get_state")
+
+    def _rect_center(self, el: dict[str, Any]) -> tuple[float, float]:
+        rect = el.get("rect")
+        if not _valid_rect(rect):
+            raise EngineError("element_not_interactable", "Element has no valid layout bounds")
+        assert isinstance(rect, dict)
+        return (
+            float(rect.get("x", 0)) + float(rect.get("width", 0)) / 2.0,
+            float(rect.get("y", 0)) + float(rect.get("height", 0)) / 2.0,
+        )
+
+    def _tab_size(self, tab_id: int) -> tuple[float, float]:
+        info = self.bridge.tabs.get(tab_id) or {}
+        return float(info.get("width") or 0), float(info.get("height") or 0)
+
+    def _in_viewport(self, tab_id: int, x: float, y: float) -> bool:
+        width, height = self._tab_size(tab_id)
+        if width <= 0 or height <= 0:
+            return True
+        return 0 <= x <= width and 0 <= y <= height
+
+    def _is_full_page_rect(self, tab_id: int, rect: dict[str, Any]) -> bool:
+        width, height = self._tab_size(tab_id)
+        if width <= 0 or height <= 0:
+            return False
+        try:
+            rw = float(rect.get("width") or 0)
+            rh = float(rect.get("height") or 0)
+        except (TypeError, ValueError):
+            return False
+        return rw >= 0.9 * width and rh >= 0.85 * height
+
+    async def _resolve_element_point(
+        self,
+        tab_id: int,
+        elements: list[dict[str, Any]],
+        element_index: int,
+    ) -> tuple[float, float]:
+        el = self._lookup_element(elements, element_index)
+        rect = el.get("rect")
+        if isinstance(rect, dict) and self._is_full_page_rect(tab_id, rect):
+            raise EngineError("element_not_interactable", "Element fills the page; pick a child control")
+        bid = el.get("backendDOMNodeId")
+        if bid is not None:
+            try:
+                res = await self.bridge.call(
+                    CDP_RAW,
+                    {
+                        "tabId": int(tab_id),
+                        "method": "DOM.getContentQuads",
+                        "params": {"backendNodeId": int(bid)},
+                    },
+                )
+            except Exception as exc:
+                raise EngineError("element_stale", f"DOM node {bid} is gone or not boxed ({exc})") from exc
+            quads = (res or {}).get("quads") if isinstance(res, dict) else None
+            if not quads:
+                raise EngineError("element_stale", f"DOM node {bid} has no content quads")
+            center = _quad_center(quads[0])
+            if center is None:
+                raise EngineError("element_not_interactable", "Element has no valid layout bounds")
+            return center
+        return self._rect_center(el)
 
     async def click(
         self,
@@ -274,12 +490,22 @@ class BrowserApi:
         element_index: int | None = None,
         elements: list[dict[str, Any]] | None = None,
         generation: str | None = None,
+        snapshot_id: str | None = None,
     ) -> dict[str, Any]:
         await self._ensure_tab(tab_id, generation)
         if element_index is not None:
+            if snapshot_id is not None:
+                latest = self.bridge.tabs.snapshot(tab_id)
+                if latest != snapshot_id:
+                    raise EngineError(
+                        "snapshot_mismatch",
+                        f"element snapshot changed (expected {snapshot_id}, now {latest})",
+                    )
             if not elements:
                 raise EngineError("unknown_element", "call browser_get_state before clicking by element_index")
-            x, y = self._element_point(elements, element_index)
+            x, y = await self._resolve_element_point(tab_id, elements, element_index)
+            if not self._in_viewport(tab_id, float(x), float(y)):
+                raise EngineError("element_not_in_viewport", f"element {element_index} center {x},{y} is outside the tab viewport")
         if x is None or y is None:
             raise EngineError("bad_coords", "click needs x,y or element_index")
         active = await self._tab_active(tab_id)
@@ -340,17 +566,25 @@ class BrowserApi:
             },
         )
         await self.move_cursor(tab_id, x2, y2, wait_arrival=False)
-        await self.bridge.call(
-            INPUT_MOUSE,
-            {
-                "tabId": int(tab_id),
-                "actions": [
-                    {"type": "mouseMoved", "x": x2, "y": y2, "button": button, "modifiers": modifiers},
-                    {"type": "mouseReleased", "x": x2, "y": y2, "button": button, "clickCount": 1, "modifiers": modifiers},
-                ],
-            },
+        dist = ((float(x2) - float(x1)) ** 2 + (float(y2) - float(y1)) ** 2) ** 0.5
+        steps = max(2, min(24, int(dist / 24.0) + 1))
+        moves: list[dict[str, Any]] = []
+        for i in range(1, steps + 1):
+            t = i / steps
+            moves.append(
+                {
+                    "type": "mouseMoved",
+                    "x": float(x1) + (float(x2) - float(x1)) * t,
+                    "y": float(y1) + (float(y2) - float(y1)) * t,
+                    "button": button,
+                    "modifiers": modifiers,
+                }
+            )
+        moves.append(
+            {"type": "mouseReleased", "x": x2, "y": y2, "button": button, "clickCount": 1, "modifiers": modifiers}
         )
-        return {"x1": x1, "y1": y1, "x2": x2, "y2": y2}
+        await self.bridge.call(INPUT_MOUSE, {"tabId": int(tab_id), "actions": moves})
+        return {"x1": x1, "y1": y1, "x2": x2, "y2": y2, "steps": steps}
 
     async def type_text(self, tab_id: int, text: str, generation: str | None = None) -> dict[str, Any]:
         await self._ensure_tab(tab_id, generation)
@@ -359,8 +593,9 @@ class BrowserApi:
 
     async def press_keys(self, tab_id: int, keys: list[str], generation: str | None = None) -> dict[str, Any]:
         await self._ensure_tab(tab_id, generation)
-        await self.bridge.call(INPUT_KEY, {"tabId": int(tab_id), "keys": keys})
-        return {"keys": keys}
+        chords = parse_browser_chords([str(k) for k in keys])
+        await self.bridge.call(INPUT_KEY, {"tabId": int(tab_id), "keys": keys, "chords": chords})
+        return {"keys": keys, "chords": chords}
 
     async def scroll(
         self,
@@ -419,6 +654,7 @@ class BrowserHost:
         self._started = False
         self._elements: dict[int, list[dict[str, Any]]] = {}
         self._shots: dict[int, str] = {}
+        self._snapshots: dict[int, str] = {}
 
     def start(self) -> None:
         if self._started:
@@ -457,7 +693,10 @@ class BrowserHost:
         loop = self._loop
         if loop is None:
             raise EngineError("bridge_error", "browser bridge loop is not running")
-        return asyncio.run_coroutine_threadsafe(coro, loop).result(timeout)
+        try:
+            return asyncio.run_coroutine_threadsafe(coro, loop).result(timeout)
+        except TimeoutError as exc:
+            raise EngineError("bridge_timeout", f"browser call timed out after {timeout:.1f}s") from exc
 
     def info(self) -> dict[str, Any]:
         self.start()
@@ -505,7 +744,7 @@ class BrowserHost:
         return {"activated": True, "tab_id": int(tab_id)}
 
     def screenshot(self, tab_id: int, generation: str | None = None) -> tuple[dict[str, Any], bytes]:
-        png, meta = self._call(self.api.screenshot(tab_id, generation=generation))
+        png, meta = self._call(self.api.screenshot(tab_id, generation=generation), timeout=40.0)
         self._shots[int(tab_id)] = str(meta.get("screenshot_id") or "")
         return meta, png
 
@@ -524,9 +763,12 @@ class BrowserHost:
                 include_screenshot=include_screenshot,
                 include_elements=include_elements,
                 max_elements=max_elements,
-            )
+            ),
+            timeout=55.0,
         )
         self._elements[int(tab_id)] = list(payload.get("elements") or [])
+        if payload.get("snapshot_id"):
+            self._snapshots[int(tab_id)] = str(payload["snapshot_id"])
         if payload.get("screenshot_id"):
             self._shots[int(tab_id)] = str(payload["screenshot_id"])
         return payload, png
@@ -540,6 +782,7 @@ class BrowserHost:
         count: int = 1,
         element_index: int | None = None,
         generation: str | None = None,
+        snapshot_id: str | None = None,
     ) -> dict[str, Any]:
         return self._call(
             self.api.click(
@@ -551,6 +794,7 @@ class BrowserHost:
                 element_index=element_index,
                 elements=self._elements.get(int(tab_id)),
                 generation=generation,
+                snapshot_id=snapshot_id if snapshot_id is not None else self._snapshots.get(int(tab_id)),
             )
         )
 

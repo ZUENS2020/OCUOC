@@ -10,11 +10,13 @@ import time
 
 import pytest
 
-from ocuoc.browser.api import BrowserApi, merge_ax_dom
+from pathlib import Path
+
+from ocuoc.browser.api import BrowserApi, elements_from_dom, merge_ax_dom, parse_browser_chords
 from ocuoc.browser.bridge import BrowserBridge, WSConn
 from ocuoc.browser.fake import FakeExtension
 from ocuoc.browser.overlay_js import content_cursor_js, content_cursor_sha256
-from ocuoc.browser.session import tab_generation
+from ocuoc.browser.session import snapshot_id, tab_generation
 from ocuoc.errors import EngineError
 from ocuoc.server import mcp
 
@@ -211,7 +213,10 @@ def test_p1_drag_second_move_does_not_wait():
             await api.drag(42, 10, 10, 80, 80)
             sets = [o for o in fake.order if o.startswith("cursor.set#")]
             assert len(sets) == 2
-            assert "input.mouse[mouseMoved+mouseReleased]" in fake.order
+            moved = [o for o in fake.order if "mouseMoved" in o]
+            assert moved
+            assert max(o.count("mouseMoved") for o in moved) >= 2
+            assert any("mouseReleased" in o for o in fake.order)
         finally:
             await _close(bridge, task)
 
@@ -225,10 +230,16 @@ def test_p2_get_state_elements_and_dpr():
             payload, png = await api.get_state(42)
             assert payload["dpr"] == 2.0
             assert payload["generation"] == tab_generation(42, "https://example.com/")
+            assert payload["snapshot_id"]
             assert payload["elements"][0]["element_index"] == 0
             assert payload["elements"][0]["rect"]["width"] == 80
             assert png
-            clicked = await api.click(42, element_index=0, elements=payload["elements"])
+            clicked = await api.click(
+                42,
+                element_index=0,
+                elements=payload["elements"],
+                snapshot_id=payload["snapshot_id"],
+            )
             assert clicked["x"] == 50.0
             assert clicked["y"] == 32.0
         finally:
@@ -318,3 +329,204 @@ def test_browser_bridge_info_schema_has_no_token_param():
     blob = str(tools["browser_bridge_info"].parameters).lower()
     assert "token" not in blob
     _ = os.environ
+
+
+def test_page_screenshot_script_does_not_activate_tab():
+    src = Path(__file__).resolve().parents[1].joinpath("ext/background.js").read_text(encoding="utf-8")
+    start = src.index("async function pageScreenshot")
+    end = src.index("async function badgeSet")
+    body = src[start:end]
+    assert "tabs.update" not in body
+    assert "Page.captureScreenshot" in body
+    src_all = Path(__file__).resolve().parents[1].joinpath("ext/background.js").read_text(encoding="utf-8")
+    assert "Accessibility" in src_all
+    assert "pageAXTree" in src_all
+    assert ".enable" in src_all
+
+
+def test_screenshot_inactive_tab_does_not_activate():
+    async def run():
+        bridge, api, fake, task = await _paired()
+        try:
+            await api.new_tab("https://example.org/")
+            await api.activate_tab(43)
+            fake.order.clear()
+            png, meta = await api.screenshot(42)
+            assert png[:8] == b"\x89PNG\r\n\x1a\n"
+            assert meta.get("tab_activated") is False
+            assert meta.get("capture_backend") == "cdp"
+            assert "tab.activate" not in fake.order
+            assert next(t for t in fake.tabs if t["tabId"] == 43)["active"] is True
+            assert next(t for t in fake.tabs if t["tabId"] == 42)["active"] is False
+        finally:
+            await _close(bridge, task)
+
+    asyncio.run(run())
+
+
+def test_click_rejects_full_page_element():
+    async def run():
+        bridge, api, fake, task = await _paired()
+        try:
+            await api.list_tabs()
+            blob = {
+                "element_index": 3,
+                "name": "Home",
+                "control_type": "WebArea",
+                "backendDOMNodeId": None,
+                "rect": {"x": 0, "y": 0, "width": 1280, "height": 800},
+                "source": "ax+dom",
+            }
+            with pytest.raises(EngineError) as exc:
+                await api.click(42, element_index=3, elements=[blob])
+            assert exc.value.code == "element_not_interactable"
+        finally:
+            await _close(bridge, task)
+
+    asyncio.run(run())
+
+
+def test_click_rejects_element_without_layout_bounds():
+    async def run():
+        bridge, api, fake, task = await _paired()
+        try:
+            ghost = {
+                "element_index": 1,
+                "name": "Ghost",
+                "control_type": "link",
+                "backendDOMNodeId": None,
+                "rect": None,
+                "source": "ax+dom",
+            }
+            with pytest.raises(EngineError) as exc:
+                await api.click(42, element_index=1, elements=[ghost])
+            assert exc.value.code == "element_not_interactable"
+        finally:
+            await _close(bridge, task)
+
+    asyncio.run(run())
+
+
+def test_stale_snapshot_id_is_rejected():
+    async def run():
+        bridge, api, fake, task = await _paired()
+        try:
+            payload, _png = await api.get_state(42, include_screenshot=False)
+            first = payload["snapshot_id"]
+            fake.ax_name = "Renamed"
+            payload2, _ = await api.get_state(42, include_screenshot=False)
+            assert payload2["snapshot_id"] != first
+            with pytest.raises(EngineError) as exc:
+                await api.click(
+                    42,
+                    element_index=0,
+                    elements=payload["elements"],
+                    snapshot_id=first,
+                )
+            assert exc.value.code == "snapshot_mismatch"
+        finally:
+            await _close(bridge, task)
+
+    asyncio.run(run())
+
+
+def test_parse_browser_chords_ctrl_a():
+    chords = parse_browser_chords(["ctrl+a", "Enter"])
+    assert chords[0]["modifiers"] == 2
+    assert chords[0]["key"] == "a"
+    assert chords[0]["modNames"] == ["ctrl"]
+    assert chords[1]["modifiers"] == 0
+    assert chords[1]["key"] == "enter"
+
+
+def test_press_keys_sends_chord_payload():
+    async def run():
+        bridge, api, fake, task = await _paired()
+        try:
+            await api.press_keys(42, ["ctrl+a"])
+            assert fake.last_key["chords"][0]["modifiers"] == 2
+            assert fake.last_key["chords"][0]["key"] == "a"
+        finally:
+            await _close(bridge, task)
+
+    asyncio.run(run())
+
+
+def test_bridge_call_timeout_drops_pending():
+    async def run():
+        bridge, api, fake, task = await _paired()
+        fake.hang_types.add("tabs.list")
+        try:
+            with pytest.raises(EngineError) as exc:
+                await bridge.call("tabs.list", timeout=0.15)
+            assert exc.value.code == "bridge_timeout"
+            assert bridge._pending == {}
+        finally:
+            fake.hang_types.clear()
+            await _close(bridge, task)
+
+    asyncio.run(run())
+
+
+def test_get_state_falls_back_when_ax_hangs():
+    async def run():
+        bridge, api, fake, task = await _paired()
+        fake.hang_types.add("page.axtree")
+        try:
+            payload, _png = await api.get_state(42, include_screenshot=False)
+            assert payload["elements"]
+            assert payload["elements"][0]["source"] == "dom"
+            assert payload["elements"][0]["name"] == "BUTTON"
+            assert payload.get("ax_error")
+            assert payload["snapshot_id"]
+        finally:
+            fake.hang_types.clear()
+            await _close(bridge, task)
+
+    asyncio.run(run())
+
+
+def test_merge_skips_webarea_and_empty_names():
+    ax = {
+        "nodes": [
+            {"ignored": False, "role": {"value": "WebArea"}, "name": {"value": "Home"}, "backendDOMNodeId": 1},
+            {"ignored": False, "role": {"value": "button"}, "name": {"value": ""}, "backendDOMNodeId": 2},
+            {"ignored": False, "role": {"value": "button"}, "name": {"value": "New"}, "backendDOMNodeId": 1},
+        ]
+    }
+    dom = {
+        "documents": [
+            {
+                "nodes": {"backendNodeId": [1]},
+                "layout": {"nodeIndex": [0], "bounds": [[10.0, 20.0, 80.0, 24.0]]},
+            }
+        ]
+    }
+    els = merge_ax_dom(ax, dom)
+    assert len(els) == 1
+    assert els[0]["name"] == "New"
+
+
+def test_elements_from_dom_skips_tiny_and_boilerplate():
+    snap = {
+        "documents": [
+            {
+                "nodes": {"backendNodeId": [1, 2, 3], "nodeName": ["HTML", "BUTTON", "SPAN"]},
+                "layout": {
+                    "nodeIndex": [0, 1, 2],
+                    "bounds": [[0, 0, 800, 600], [10, 20, 80, 24], [1, 1, 2, 2]],
+                },
+            }
+        ]
+    }
+    els = elements_from_dom(snap)
+    assert len(els) == 1
+    assert els[0]["name"] == "BUTTON"
+    assert els[0]["rect"]["width"] == 80
+
+
+def test_snapshot_id_changes_with_element_tree():
+    a = snapshot_id([{"element_index": 0, "name": "Go", "rect": {"x": 1, "y": 2, "width": 3, "height": 4}}])
+    b = snapshot_id([{"element_index": 0, "name": "Gone", "rect": {"x": 1, "y": 2, "width": 3, "height": 4}}])
+    assert a != b
+    assert len(a) == 16

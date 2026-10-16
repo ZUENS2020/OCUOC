@@ -106,9 +106,8 @@ async function handle(type, d) {
     case 'input.key':        return inputKey(d);
 
     case 'page.screenshot':  return pageScreenshot(d);
-    case 'page.axtree':      return cdpCall(d.tabId, 'Accessibility.getFullAXTree', {});
-    case 'page.dom':         return cdpCall(d.tabId, 'DOMSnapshot.captureSnapshot',
-                                        { computedStyles: [], includeDOMRects: true, includePaintOrder: false });
+    case 'page.axtree':      return pageAXTree(d);
+    case 'page.dom':         return pageDomSnapshot(d);
     case 'page.dialog':      return cdpCall(d.tabId, 'Page.handleJavaScriptDialog',
                                         { accept: !!d.accept, promptText: d.promptText || '' });
     case 'page.eval':        return cdpCall(d.tabId, 'Runtime.evaluate',
@@ -169,6 +168,16 @@ async function cursorSet(d) {
 }
 
 // ── CDP(chrome.debugger) ───────────────────────────────────────────────────
+async function cdpSend(tabId, method, params) {
+  return new Promise((resolve, reject) => {
+    chrome.debugger.sendCommand({ tabId }, method, params || {}, (result) => {
+      const err = chrome.runtime.lastError;
+      if (err) reject(new Error(err.message || String(err)));
+      else resolve(result || {});
+    });
+  });
+}
+
 async function debuggerAttach(tabId) {
   if (debuggerTabs.has(tabId)) return;
   await new Promise((resolve, reject) => {
@@ -182,14 +191,9 @@ async function debuggerAttach(tabId) {
     });
   });
   debuggerTabs.add(tabId);
-  try {
-    await new Promise((resolve, reject) => {
-      chrome.debugger.sendCommand({ tabId }, 'Page.enable', {}, () => {
-        const err = chrome.runtime.lastError;
-        if (err) reject(new Error(err.message)); else resolve();
-      });
-    });
-  } catch (_e) {}
+  for (const domain of ['Page', 'Runtime', 'DOM', 'Accessibility']) {
+    try { await cdpSend(tabId, domain + '.enable', {}); } catch (_e) {}
+  }
 }
 
 chrome.debugger.onDetach.addListener((source) => {
@@ -198,11 +202,22 @@ chrome.debugger.onDetach.addListener((source) => {
 
 async function cdpCall(tabId, method, params) {
   await debuggerAttach(tabId);
-  return new Promise((resolve, reject) => {
-    chrome.debugger.sendCommand({ tabId }, method, params, (result) => {
-      const err = chrome.runtime.lastError;
-      if (err) reject(new Error(err.message)); else resolve(result);
-    });
+  return cdpSend(tabId, method, params);
+}
+
+async function pageAXTree(d) {
+  await debuggerAttach(d.tabId);
+  const params = {};
+  if (d.depth != null) params.depth = d.depth;
+  return cdpSend(d.tabId, 'Accessibility.getFullAXTree', params);
+}
+
+async function pageDomSnapshot(d) {
+  await debuggerAttach(d.tabId);
+  return cdpSend(d.tabId, 'DOMSnapshot.captureSnapshot', {
+    computedStyles: [],
+    includeDOMRects: true,
+    includePaintOrder: false,
   });
 }
 
@@ -239,35 +254,134 @@ const KEY_TABLE = {
   ArrowDown:{ keyCode: 40, code: 'ArrowDown', key: 'ArrowDown' },
   ArrowLeft:{ keyCode: 37, code: 'ArrowLeft', key: 'ArrowLeft' },
   ArrowRight:{ keyCode: 39,code: 'ArrowRight',key: 'ArrowRight' },
+  Space:   { keyCode: 32,  code: 'Space',     key: ' ', text: ' ' },
+  Home:    { keyCode: 36,  code: 'Home',      key: 'Home' },
+  End:     { keyCode: 35,  code: 'End',       key: 'End' },
 };
 
-async function inputKey(d) {
-  // d: {tabId, keys:["Enter","ArrowDown",...], modifiers?}
-  for (const name of d.keys) {
-    const k = KEY_TABLE[name] || { keyCode: name.toUpperCase().charCodeAt(0), code: name, key: name };
-    const base = { key: k.key, code: k.code, windowsVirtualKeyCode: k.keyCode,
-                   nativeVirtualKeyCode: k.keyCode, modifiers: d.modifiers ?? 0 };
-    await cdpCall(d.tabId, 'Input.dispatchKeyEvent', { type: 'rawKeyDown', ...base });
-    if (k.text) await cdpCall(d.tabId, 'Input.dispatchKeyEvent', { type: 'char', text: k.text, ...base });
-    await cdpCall(d.tabId, 'Input.dispatchKeyEvent', { type: 'keyUp', ...base });
+const KEY_ALIASES = {
+  enter: 'Enter', return: 'Enter', tab: 'Tab', escape: 'Escape', esc: 'Escape',
+  backspace: 'Backspace', delete: 'Delete', del: 'Delete', space: 'Space',
+  arrowup: 'ArrowUp', up: 'ArrowUp', arrowdown: 'ArrowDown', down: 'ArrowDown',
+  arrowleft: 'ArrowLeft', left: 'ArrowLeft', arrowright: 'ArrowRight', right: 'ArrowRight',
+  home: 'Home', end: 'End',
+};
+
+const MOD_KEY = {
+  alt:   { key: 'Alt',     code: 'AltLeft',     keyCode: 18 },
+  ctrl:  { key: 'Control', code: 'ControlLeft', keyCode: 17 },
+  meta:  { key: 'Meta',    code: 'MetaLeft',    keyCode: 91 },
+  shift: { key: 'Shift',   code: 'ShiftLeft',   keyCode: 16 },
+};
+
+function describeKey(name) {
+  const alias = KEY_ALIASES[String(name || '').toLowerCase()];
+  if (alias && KEY_TABLE[alias]) return KEY_TABLE[alias];
+  if (KEY_TABLE[name]) return KEY_TABLE[name];
+  const raw = String(name || '');
+  if (raw.length === 1) {
+    const upper = raw.toUpperCase();
+    const isLetter = /^[a-zA-Z]$/.test(raw);
+    const isDigit = /^[0-9]$/.test(raw);
+    return {
+      keyCode: upper.charCodeAt(0),
+      code: isLetter ? ('Key' + upper) : (isDigit ? ('Digit' + raw) : raw),
+      key: isLetter ? raw.toLowerCase() : raw,
+      text: (isLetter || isDigit) ? raw.toLowerCase() : raw,
+    };
   }
-  return { ok: true };
+  return { keyCode: raw.toUpperCase().charCodeAt(0) || 0, code: raw, key: raw };
+}
+
+function parseChord(spec) {
+  const parts = String(spec || '').replace(/-/g, '+').split('+').map((p) => p.trim()).filter(Boolean);
+  const modNames = [];
+  let key = parts[parts.length - 1] || '';
+  let modifiers = 0;
+  for (let i = 0; i < parts.length - 1; i++) {
+    const n = parts[i].toLowerCase();
+    if (n === 'alt') { modifiers |= 1; modNames.push('alt'); }
+    else if (n === 'ctrl' || n === 'control') { modifiers |= 2; modNames.push('ctrl'); }
+    else if (n === 'meta' || n === 'cmd' || n === 'command' || n === 'win') { modifiers |= 4; modNames.push('meta'); }
+    else if (n === 'shift') { modifiers |= 8; modNames.push('shift'); }
+  }
+  return { key, modifiers, modNames };
+}
+
+async function dispatchKey(tabId, desc, type, modifiers) {
+  const base = {
+    key: desc.key, code: desc.code, windowsVirtualKeyCode: desc.keyCode,
+    nativeVirtualKeyCode: desc.keyCode, modifiers,
+  };
+  if (type === 'char' && desc.text) base.text = desc.text;
+  await cdpCall(tabId, 'Input.dispatchKeyEvent', { type, ...base });
+}
+
+async function inputKey(d) {
+  // d: {tabId, keys:["ctrl+a","Enter"], chords?:[{key,modifiers,modNames}]}
+  const chords = Array.isArray(d.chords) && d.chords.length
+    ? d.chords
+    : (d.keys || []).map(parseChord);
+  for (const chord of chords) {
+    const modNames = chord.modNames || [];
+    const modifiers = chord.modifiers || 0;
+    let down = 0;
+    for (const name of modNames) {
+      const mk = MOD_KEY[name];
+      if (!mk) continue;
+      down |= (name === 'alt' ? 1 : name === 'ctrl' ? 2 : name === 'meta' ? 4 : 8);
+      await dispatchKey(d.tabId, mk, 'rawKeyDown', down);
+    }
+    const desc = describeKey(chord.key);
+    await dispatchKey(d.tabId, desc, 'rawKeyDown', modifiers);
+    if (desc.text && !(modifiers & 2) && !(modifiers & 4)) {
+      await dispatchKey(d.tabId, desc, 'char', modifiers);
+    }
+    await dispatchKey(d.tabId, desc, 'keyUp', modifiers);
+    for (const name of [...modNames].reverse()) {
+      const mk = MOD_KEY[name];
+      if (!mk) continue;
+      down &= ~(name === 'alt' ? 1 : name === 'ctrl' ? 2 : name === 'meta' ? 4 : 8);
+      await dispatchKey(d.tabId, mk, 'keyUp', down);
+    }
+  }
+  return { ok: true, chords };
 }
 
 // ── 截图(视口) ─────────────────────────────────────────────────────────────
 async function pageScreenshot(d) {
-  await chrome.tabs.update(d.tabId, { active: true });
-  const tab = (await waitTabReady(d.tabId, 8000)) || await chrome.tabs.get(d.tabId);
-  try {
-    const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format: d.format || 'png' });
-    return { dataUrl, note: 'captureVisibleTab: 像素含 DPR,坐标换算见计划文档 §2.4' };
-  } catch (_err) {
-    const res = await cdpCall(d.tabId, 'Page.captureScreenshot', { format: d.format || 'png' });
-    const mime = (d.format || 'png') === 'jpeg' ? 'image/jpeg' : 'image/png';
+  const format = d.format || 'png';
+  const mime = format === 'jpeg' ? 'image/jpeg' : 'image/png';
+  let tab;
+  try { tab = await chrome.tabs.get(d.tabId); } catch (err) {
+    throw new Error(`unknown_tab: ${err && err.message || err}`);
+  }
+  if (tab.discarded) {
+    throw new Error('tab_discarded: background tab was discarded; call browser_activate_tab to reload it');
+  }
+  const tryCapture = async (fromSurface) => {
+    const res = await cdpCall(d.tabId, 'Page.captureScreenshot', { format, fromSurface });
     return {
       dataUrl: `data:${mime};base64,${(res && res.data) || ''}`,
-      note: 'Page.captureScreenshot fallback when captureVisibleTab is blocked for this URL',
+      backend: 'cdp',
+      activated: false,
+      fromSurface,
     };
+  };
+  try {
+    return await tryCapture(true);
+  } catch (err) {
+    try {
+      return await tryCapture(false);
+    } catch (err2) {
+      if (!tab.active) {
+        throw new Error(
+          `screenshot_requires_visible_tab: ${err2 && err2.message || err && err.message || err2}`
+        );
+      }
+      const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format });
+      return { dataUrl, backend: 'captureVisibleTab', activated: false };
+    }
   }
 }
 
